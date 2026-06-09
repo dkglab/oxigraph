@@ -34,6 +34,7 @@ use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::iter::{Peekable, empty, once};
 use std::marker::PhantomData;
+use std::mem::take;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, atomic};
@@ -304,14 +305,17 @@ struct EncodedDatasetSpec<T> {
     named: Option<Vec<T>>,
 }
 
+#[derive(Clone)]
 pub struct InternalTuple<T> {
     inner: Vec<Option<T>>,
+    graph_name: Option<T>,
 }
 
 impl<T> InternalTuple<T> {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             inner: Vec::with_capacity(capacity),
+            graph_name: None,
         }
     }
 
@@ -357,7 +361,10 @@ impl<T: Clone + Eq> InternalTuple<T> {
                     }
                 }
             }
-            Some(Self { inner: result })
+            Some(Self {
+                inner: result,
+                graph_name: self.graph_name.clone(),
+            })
         } else {
             let mut result = self.inner.clone();
             for (key, other_value) in other.inner.iter().enumerate() {
@@ -372,15 +379,10 @@ impl<T: Clone + Eq> InternalTuple<T> {
                     }
                 }
             }
-            Some(Self { inner: result })
-        }
-    }
-}
-
-impl<T: Clone> Clone for InternalTuple<T> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
+            Some(Self {
+                inner: result,
+                graph_name: self.graph_name.clone(),
+            })
         }
     }
 }
@@ -752,7 +754,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                         }
                         .map(Some)
                     } else {
-                        Some(None) // default graph
+                        Some(from.graph_name.clone()) // default graph
                     };
                     let iter = dataset.internal_quads_for_pattern(
                         input_subject.as_ref(),
@@ -875,7 +877,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                         }
                         .map(Some)
                     } else {
-                        Some(None) // default graph
+                        Some(from.graph_name.clone()) // default graph
                     };
                     match (input_subject, input_object, input_graph_name) {
                         (Some(input_subject), Some(input_object), Some(input_graph_name)) => {
@@ -1151,14 +1153,17 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     }
                 })
             }
-            GraphPattern::Graph { graph_name } => {
+            GraphPattern::Graph { graph_name, inner } => {
+                let (child, child_stats) = self.graph_pattern_evaluator(inner, encoded_variables);
+                stat_children.push(child_stats);
+                let child = child?;
                 let graph_name_selector = TupleSelector::from_named_node_pattern(
                     graph_name,
                     encoded_variables,
                     &self.dataset,
                 )?;
                 let dataset = self.dataset.clone();
-                Rc::new(move |from| {
+                Rc::new(move |mut from| {
                     let input_graph_name = match graph_name_selector.get_pattern_value(
                         &from,
                         #[cfg(feature = "sparql-12")]
@@ -1169,32 +1174,51 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     };
                     if let Some(input_graph_name) = input_graph_name {
                         match dataset.contains_internal_graph_name(&input_graph_name) {
-                            Ok(true) => Box::new(once(Ok(from))),
+                            Ok(true) => {
+                                let previous_graph_name = take(&mut from.graph_name);
+                                from.graph_name = Some(input_graph_name);
+                                Box::new(child(from).map(move |tuple| {
+                                    let mut tuple = tuple?;
+                                    tuple.graph_name.clone_from(&previous_graph_name);
+                                    Ok(tuple)
+                                }))
+                            }
                             Ok(false) => Box::new(empty()),
                             Err(e) => Box::new(once(Err(e))),
                         }
                     } else {
                         let graph_name_selector = graph_name_selector.clone();
+                        let child = Rc::clone(&child);
                         #[cfg(feature = "sparql-12")]
                         let dataset = dataset.clone();
+                        let previous_graph_name = take(&mut from.graph_name);
                         Box::new(
                             dataset
                                 .internal_named_graphs()
-                                .map(move |graph_name| {
-                                    let graph_name = graph_name?;
-                                    let mut new_tuple = from.clone();
-                                    if !put_pattern_value::<D>(
-                                        &graph_name_selector,
-                                        graph_name,
-                                        &mut new_tuple,
-                                        #[cfg(feature = "sparql-12")]
-                                        &dataset,
-                                    )? {
-                                        return Ok(None);
-                                    }
-                                    Ok(Some(new_tuple))
-                                })
-                                .filter_map(Result::transpose),
+                                .flat_map_ok(move |graph_name| {
+                                    let graph_name_selector = graph_name_selector.clone();
+                                    #[cfg(feature = "sparql-12")]
+                                    let dataset = dataset.clone();
+                                    let previous_graph_name = previous_graph_name.clone();
+                                    let mut from = from.clone();
+                                    from.graph_name = Some(graph_name.clone());
+                                    child(from)
+                                        .map(move |tuple| {
+                                            let mut tuple = tuple?;
+                                            if !put_pattern_value::<D>(
+                                                &graph_name_selector,
+                                                graph_name.clone(),
+                                                &mut tuple,
+                                                #[cfg(feature = "sparql-12")]
+                                                &dataset,
+                                            )? {
+                                                return Ok(None);
+                                            }
+                                            tuple.graph_name.clone_from(&previous_graph_name);
+                                            Ok(Some(tuple))
+                                        })
+                                        .filter_map(Result::transpose)
+                                }),
                         )
                     }
                 })
@@ -1304,7 +1328,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                         return Ok(Rc::new(move |from| {
                             Box::new(ForLoopLeftJoinIterator {
                                 right_evaluator: Rc::clone(&right),
-                                left_iter: left(from),
+                                left_iter: left(from.clone()),
                                 current_right: Box::new(empty()),
                                 left_tuple_to_yield: None,
                             })
@@ -1316,7 +1340,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                 let right = right?;
                 Rc::new(move |from| {
                     let right = Rc::clone(&right);
-                    Box::new(left(from).flat_map(move |t| match t {
+                    Box::new(left(from.clone()).flat_map(move |t| match t {
                         Ok(t) => right(t),
                         Err(e) => Box::new(once(Err(e))),
                     }))
@@ -1634,6 +1658,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                             input_tuple.set(*input_key, value.clone());
                         }
                     }
+                    input_tuple.graph_name.clone_from(&from.graph_name);
                     Box::new(child(input_tuple).filter_map(move |tuple| {
                         match tuple {
                             Ok(tuple) => {
@@ -1988,7 +2013,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
 
     /// Evaluates an expression and returns an internal term
     ///
-    /// Returns None if building such expression would mean to convert back to an internal term at the end.
+    /// Returns None if building such expression implies to convert back to an internal term at the end.
     #[expect(clippy::type_complexity)]
     fn internal_expression_evaluator(
         &self,
@@ -4439,7 +4464,7 @@ fn eval_node_label(node: &GraphPattern) -> String {
         GraphPattern::Filter { expression, .. } => {
             format!("Filter({})", FormattableExpression(expression))
         }
-        GraphPattern::Graph { graph_name } => format!("Graph({graph_name})"),
+        GraphPattern::Graph { graph_name, .. } => format!("Graph({graph_name})"),
         GraphPattern::Group {
             variables,
             aggregates,
