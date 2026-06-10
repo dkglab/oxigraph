@@ -1,0 +1,13 @@
+[package]
+name = "in-memory-sparql"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Depend on this repo's oxigraph crate with the on-disk RocksDB backend turned off,
+# so the example builds with no extra system dependencies.
+oxigraph = { path = "../../lib/oxigraph", default-features = false }
+
+# Detach from the root workspace: this example is its own tiny workspace.
+[workspace]
