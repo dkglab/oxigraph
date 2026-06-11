@@ -6,7 +6,7 @@ use crate::utils::{to_option, to_option_ref};
 use js_sys::{Array, Map, try_iter};
 use oxigraph::io::{RdfParser, RdfSerializer};
 use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
-use oxigraph::sparql::{QueryResults, SparqlEvaluator};
+use oxigraph::sparql::{QueryResults, QuerySolutionIter, SparqlEvaluator, Variable};
 use oxigraph::store::Store;
 use wasm_bindgen::prelude::*;
 
@@ -336,6 +336,84 @@ impl JsStore {
         }
         .map_err(JsError::from)?;
         Ok(String::from_utf8(buffer).map_err(JsError::from)?)
+    }
+
+    // SPIKE: lazy streaming SELECT. Returns a cursor that holds the
+    // QuerySolutionIter alive instead of draining it into an Array, so the
+    // worker never materializes the whole result set. Minimal option parsing
+    // (base_iri only) — the production version reuses query()'s full parsing.
+    #[wasm_bindgen(js_name = querySolutions)]
+    pub fn query_solutions(
+        &self,
+        query: &str,
+        options: &JsValue,
+    ) -> Result<JsQuerySolutions, JsValue> {
+        let mut base_iri = None;
+        if let Some(options) = to_option_ref(options) {
+            base_iri = convert_base_iri(&reflect_get(options, &BASE_IRI)?)?;
+        }
+        let mut evaluator = SparqlEvaluator::new();
+        if let Some(base_iri) = base_iri {
+            evaluator = evaluator.with_base_iri(&base_iri).map_err(JsError::from)?;
+        }
+        let results = evaluator
+            .parse_query(query)
+            .map_err(JsError::from)?
+            .on_store(&self.store)
+            .execute()
+            .map_err(JsError::from)?;
+        match results {
+            QueryResults::Solutions(solutions) => Ok(JsQuerySolutions {
+                variables: solutions.variables().to_vec(),
+                iter: solutions,
+                data_factory: default_data_factory(),
+            }),
+            _ => Err(format_err!("querySolutions only supports SELECT queries")),
+        }
+    }
+}
+
+// SPIKE: a JS-exposed cursor over a lazy SELECT iterator. The iterator is
+// QuerySolutionIter<'static> because on_store() snapshots the storage rather
+// than borrowing &Store, so there is no self-referential borrow to fight.
+#[wasm_bindgen(js_name = QuerySolutions)]
+pub struct JsQuerySolutions {
+    iter: QuerySolutionIter<'static>,
+    variables: Vec<Variable>,
+    data_factory: DataFactory,
+}
+
+#[wasm_bindgen(js_class = QuerySolutions)]
+impl JsQuerySolutions {
+    #[wasm_bindgen(getter)]
+    pub fn variables(&self) -> Array {
+        self.variables
+            .iter()
+            .map(|v| JsValue::from_str(v.as_str()))
+            .collect()
+    }
+
+    // Pull up to `count` rows. An empty Array signals exhaustion. One
+    // wasm->JS crossing per batch (not per row) — exactly the shape the
+    // graph-store batch protocol wants.
+    #[wasm_bindgen(js_name = nextBatch)]
+    pub fn next_batch(&mut self, count: usize) -> Result<Array, JsValue> {
+        let out = Array::new();
+        for _ in 0..count {
+            let Some(solution) = self.iter.next() else {
+                break;
+            };
+            let solution = solution.map_err(JsError::from)?;
+            let result = Map::new();
+            for (variable, value) in solution.iter() {
+                result.set(
+                    &variable.as_str().into(),
+                    &from_term(&self.data_factory, value),
+                );
+            }
+            out.push(&result.into());
+        }
+        Ok(out)
     }
 }
 
