@@ -62,12 +62,46 @@ export class Store {
         }
     ): boolean | Map<string, Term>[] | Quad[] | string;
 
+    querySolutions(
+        query: string,
+        options?: {
+            base_iri?: NamedNode | string;
+            default_graph?: BlankNode | DefaultGraph | NamedNode | Iterable<BlankNode | DefaultGraph | NamedNode>;
+            named_graphs?: Iterable<BlankNode | NamedNode>;
+            use_default_graph_as_union?: boolean;
+        }
+    ): QuerySolutions;
+
+    queryTriples(
+        query: string,
+        options?: {
+            base_iri?: NamedNode | string;
+            default_graph?: BlankNode | DefaultGraph | NamedNode | Iterable<BlankNode | DefaultGraph | NamedNode>;
+            named_graphs?: Iterable<BlankNode | NamedNode>;
+            use_default_graph_as_union?: boolean;
+        }
+    ): QueryTriples;
+
     update(
         update: string,
         options?: {
             base_iri?: NamedNode | string;
         }
     ): void;
+}
+
+export class QuerySolutions {
+    readonly variables: string[];
+
+    nextBatch(count: number): Map<string, Term>[];
+
+    free(): void;
+}
+
+export class QueryTriples {
+    nextBatch(count: number): Quad[];
+
+    free(): void;
 }
 
 function parse(

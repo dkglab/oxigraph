@@ -182,6 +182,39 @@ console.log(store.query("ASK { <s> ?p ?o }", {
 }));
 ```
 
+#### `Store.prototype.querySolutions(String query, object options)`
+Executes a [SPARQL 1.1 `SELECT` query](https://www.w3.org/TR/sparql11-query/#select) and returns a `QuerySolutions` cursor that yields results **lazily**, in bounded batches, instead of materializing the whole result set into an array like `query()` does. This keeps memory bounded for very large result sets — useful in particular for the 32-bit WASM heap and for streaming results across a worker boundary without serializing everything into one string.
+
+It accepts the same evaluation options as `query()` (`base_iri`, `default_graph`, `named_graphs`, `use_default_graph_as_union`); `results_format` does not apply. It throws if the query is not a `SELECT`.
+
+```js
+const cursor = store.querySolutions("SELECT ?s ?p ?o WHERE { ?s ?p ?o }");
+console.log(cursor.variables); // ["s", "p", "o"], available before pulling any row
+for (let batch = cursor.nextBatch(1000); batch.length > 0; batch = cursor.nextBatch(1000)) {
+    for (const binding of batch) {
+        console.log(binding.get("s").value);
+    }
+}
+cursor.free(); // release the cursor's storage snapshot (see below)
+```
+
+`QuerySolutions.prototype.nextBatch(Number count)` pulls up to `count` solutions (each a `Map` from bound variable name to `Term`). An **empty array signals exhaustion**; because of this, `count` must be at least `1`. `QuerySolutions.prototype.variables` is the array of selected variable names.
+
+A cursor pins an MVCC **snapshot** of the store taken at query time: it keeps yielding the rows that matched when it was opened even if the store is concurrently mutated (loaded, cleared, or updated), and it holds that snapshot resident until released. Call `QuerySolutions.prototype.free()` when done to release it.
+
+#### `Store.prototype.queryTriples(String query, object options)`
+The triple-producing dual of `querySolutions()`: executes a [SPARQL 1.1 `CONSTRUCT` or `DESCRIBE` query](https://www.w3.org/TR/sparql11-query/#construct) and returns a `QueryTriples` cursor that yields `Quad`s lazily in bounded batches. Same options and snapshot/`free()` semantics as `querySolutions()`. It throws if the query is not a `CONSTRUCT` or `DESCRIBE`.
+
+```js
+const cursor = store.queryTriples("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }");
+for (let batch = cursor.nextBatch(1000); batch.length > 0; batch = cursor.nextBatch(1000)) {
+    for (const quad of batch) {
+        console.log(quad.subject.value);
+    }
+}
+cursor.free();
+```
+
 #### `Store.prototype.update(String query, object options)`
 Executes a [SPARQL 1.1 Update](https://www.w3.org/TR/sparql11-update/).
 The [`LOAD` operation](https://www.w3.org/TR/sparql11-update/#load) is not supported yet.

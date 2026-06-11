@@ -170,6 +170,211 @@ describe("Store", () => {
         });
     });
 
+    // Three distinct quads in the default graph, for batching tests.
+    const q1 = dataModel.quad(ex, ex, ex);
+    const q2 = dataModel.quad(ex, ex, ex2);
+    const q3 = dataModel.quad(ex2, ex, ex);
+
+    // Pull every row out of a cursor, batchSize rows at a time, until exhausted.
+    function drainSolutions(
+        cursor: { nextBatch(count: number): Map<string, Term>[] },
+        batchSize = 2,
+    ): Map<string, Term>[] {
+        const all: Map<string, Term>[] = [];
+        for (;;) {
+            const batch = cursor.nextBatch(batchSize);
+            if (batch.length === 0) break;
+            all.push(...batch);
+        }
+        return all;
+    }
+
+    describe("#querySolutions()", () => {
+        it("exposes variables up front", () => {
+            const store = new Store([q1]);
+            const cursor = store.querySolutions("SELECT ?s ?p ?o WHERE { ?s ?p ?o }");
+            assert.deepStrictEqual(["s", "p", "o"], cursor.variables);
+        });
+
+        it("streams in bounded batches, empty batch signals exhaustion", () => {
+            const store = new Store([q1, q2, q3]);
+            const cursor = store.querySolutions("SELECT ?s ?p ?o WHERE { ?s ?p ?o }");
+            assert.strictEqual(2, cursor.nextBatch(2).length);
+            assert.strictEqual(1, cursor.nextBatch(2).length);
+            assert.strictEqual(0, cursor.nextBatch(2).length);
+        });
+
+        it("a batch larger than the result returns everything, then exhausts", () => {
+            const store = new Store([q1, q2, q3]);
+            const cursor = store.querySolutions("SELECT ?s ?p ?o WHERE { ?s ?p ?o }");
+            assert.strictEqual(3, cursor.nextBatch(100).length);
+            assert.strictEqual(0, cursor.nextBatch(100).length);
+        });
+
+        it("exhaustion is stable across repeated pulls", () => {
+            const store = new Store([q1]);
+            const cursor = store.querySolutions("SELECT ?s WHERE { ?s ?p ?o }");
+            assert.strictEqual(1, cursor.nextBatch(10).length);
+            assert.strictEqual(0, cursor.nextBatch(10).length);
+            assert.strictEqual(0, cursor.nextBatch(10).length);
+        });
+
+        it("an empty result set yields an empty batch but still has variables", () => {
+            const store = new Store([q1]);
+            const cursor = store.querySolutions("SELECT ?s WHERE { ?s ?p <http://nope> }");
+            assert.deepStrictEqual(["s"], cursor.variables);
+            assert.strictEqual(0, cursor.nextBatch(10).length);
+        });
+
+        it("yields faithful RDF/JS terms", () => {
+            const lit = dataModel.literal("hi", "en");
+            const store = new Store([dataModel.quad(ex, ex2, lit)]);
+            const rows = store.querySolutions("SELECT ?s ?o WHERE { ?s ?p ?o }").nextBatch(10);
+            assert.strictEqual(1, rows.length);
+            assert(ex.equals(rows[0]?.get("s")));
+            assert(lit.equals(rows[0]?.get("o")));
+        });
+
+        it("honours the base_iri option", () => {
+            const store = new Store();
+            const rows = store
+                .querySolutions("SELECT * WHERE { BIND(<t> AS ?t) }", {
+                    base_iri: "http://example.com/",
+                })
+                .nextBatch(10);
+            assert.strictEqual(1, rows.length);
+            assert(dataModel.namedNode("http://example.com/t").equals(rows[0]?.get("t")));
+        });
+
+        it("honours use_default_graph_as_union", () => {
+            const store = new Store([dataModel.quad(ex, ex, ex, ex)]);
+            const cursor = store.querySolutions("SELECT * WHERE { ?s ?p ?o }", {
+                use_default_graph_as_union: true,
+            });
+            assert.strictEqual(1, drainSolutions(cursor).length);
+        });
+
+        it("honours an explicit default_graph", () => {
+            const store = new Store([dataModel.quad(ex, ex, ex, ex)]);
+            const cursor = store.querySolutions("SELECT * WHERE { ?s ?p ?o }", {
+                default_graph: ex,
+            });
+            assert.strictEqual(1, drainSolutions(cursor).length);
+        });
+
+        it("honours a named_graphs list", () => {
+            const store = new Store([
+                dataModel.quad(ex, ex, ex, ex),
+                dataModel.quad(ex, ex, ex, ex2),
+            ]);
+            const cursor = store.querySolutions("SELECT * WHERE { GRAPH ?g { ?s ?p ?o } }", {
+                named_graphs: [ex],
+            });
+            assert.strictEqual(1, drainSolutions(cursor).length);
+        });
+
+        it("rejects non-SELECT queries", () => {
+            const store = new Store([q1]);
+            assert.throws(() => store.querySolutions("ASK { ?s ?p ?o }"), /SELECT/);
+            assert.throws(
+                () => store.querySolutions("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }"),
+                /SELECT/,
+            );
+            assert.throws(() => store.querySolutions("DESCRIBE <http://example.com>"), /SELECT/);
+        });
+
+        it("rejects a zero-sized batch (the empty batch is reserved for exhaustion)", () => {
+            const store = new Store([q1]);
+            const cursor = store.querySolutions("SELECT ?s WHERE { ?s ?p ?o }");
+            assert.throws(() => cursor.nextBatch(0));
+        });
+
+        it("is isolated from concurrent mutation (MVCC snapshot)", () => {
+            const store = new Store([q1, q2, q3]);
+            const cursor = store.querySolutions("SELECT ?s ?p ?o WHERE { ?s ?p ?o }");
+            assert.strictEqual(1, cursor.nextBatch(1).length);
+            store.update("DELETE WHERE { ?s ?p ?o }");
+            assert.strictEqual(0, store.size);
+            // The open cursor still sees the snapshot taken at query time.
+            assert.strictEqual(2, drainSolutions(cursor, 10).length);
+        });
+
+        it("can no longer be used after free()", () => {
+            const store = new Store([q1]);
+            const cursor = store.querySolutions("SELECT ?s WHERE { ?s ?p ?o }");
+            cursor.free();
+            assert.throws(() => cursor.nextBatch(1));
+        });
+    });
+
+    describe("#queryTriples()", () => {
+        it("streams triples in bounded batches, empty batch signals exhaustion", () => {
+            const store = new Store([q1, q2, q3]);
+            const cursor = store.queryTriples("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }");
+            assert.strictEqual(2, cursor.nextBatch(2).length);
+            assert.strictEqual(1, cursor.nextBatch(2).length);
+            assert.strictEqual(0, cursor.nextBatch(2).length);
+        });
+
+        it("yields faithful RDF/JS quads", () => {
+            const store = new Store([q1]);
+            const rows = store
+                .queryTriples("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }")
+                .nextBatch(10);
+            assert.strictEqual(1, rows.length);
+            assert(dataModel.quad(ex, ex, ex).equals(rows[0]));
+        });
+
+        it("supports DESCRIBE", () => {
+            const store = new Store([q1]);
+            const rows = store.queryTriples("DESCRIBE <http://example.com>").nextBatch(10);
+            assert(rows.length >= 1);
+            assert(dataModel.quad(ex, ex, ex).equals(rows[0]));
+        });
+
+        it("an empty result set yields an empty batch", () => {
+            const store = new Store([q1]);
+            const cursor = store.queryTriples(
+                "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p <http://nope> }",
+            );
+            assert.strictEqual(0, cursor.nextBatch(10).length);
+        });
+
+        it("rejects non-CONSTRUCT/DESCRIBE queries", () => {
+            const store = new Store([q1]);
+            assert.throws(() => store.queryTriples("SELECT ?s WHERE { ?s ?p ?o }"), /CONSTRUCT/);
+            assert.throws(() => store.queryTriples("ASK { ?s ?p ?o }"), /CONSTRUCT/);
+        });
+
+        it("rejects a zero-sized batch", () => {
+            const store = new Store([q1]);
+            const cursor = store.queryTriples("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }");
+            assert.throws(() => cursor.nextBatch(0));
+        });
+
+        it("is isolated from concurrent mutation (MVCC snapshot)", () => {
+            const store = new Store([q1, q2, q3]);
+            const cursor = store.queryTriples("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }");
+            assert.strictEqual(1, cursor.nextBatch(1).length);
+            store.update("DELETE WHERE { ?s ?p ?o }");
+            assert.strictEqual(0, store.size);
+            let seen = 1;
+            for (;;) {
+                const batch = cursor.nextBatch(10);
+                if (batch.length === 0) break;
+                seen += batch.length;
+            }
+            assert.strictEqual(3, seen);
+        });
+
+        it("can no longer be used after free()", () => {
+            const store = new Store([q1]);
+            const cursor = store.queryTriples("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }");
+            cursor.free();
+            assert.throws(() => cursor.nextBatch(1));
+        });
+    });
+
     describe("#update()", () => {
         it("INSERT DATA", () => {
             const store = new Store();
