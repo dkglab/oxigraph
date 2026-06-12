@@ -1,0 +1,26 @@
+{
+  "name": "oxigraph",
+  "description": "JavaScript bindings of Oxigraph — dkglab fork with lazy streaming query cursors (querySolutions / queryTriples). Built from dkglab/oxigraph main; self-contained web + node targets.",
+  "version": "0.5.8",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dkglab/oxigraph.git",
+    "directory": "js"
+  },
+  "files": [
+    "web.js",
+    "web_bg.wasm",
+    "web.d.ts",
+    "web_bg.wasm.d.ts",
+    "node.js",
+    "node_bg.wasm",
+    "node.d.ts",
+    "node_bg.wasm.d.ts"
+  ],
+  "main": "node.js",
+  "module": "web.js",
+  "browser": "web.js",
+  "types": "node.d.ts",
+  "homepage": "https://github.com/dkglab/oxigraph/tree/main/js"
+}
